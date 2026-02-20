@@ -15,6 +15,7 @@ from nav_msgs.msg import OccupancyGrid
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
@@ -120,6 +121,7 @@ class RobotTaskExecutorNode(Node):
         self._last_tf_static_msg_s: float | None = None
         self._pending_goal_task_id: str | None = None
         self._pending_goal_future = None
+        self._pending_cancel_task_ids: set[str] = set()
         self._active_goal_task_id: str | None = None
         self._active_goal_handle = None
         self._active_goal_sent_s: float | None = None
@@ -150,11 +152,18 @@ class RobotTaskExecutorNode(Node):
                 )
 
         if self.require_map:
+            # Nav2 map_server commonly publishes /map as a transient-local latched topic.
+            map_qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
             self.map_sub = self.create_subscription(
                 OccupancyGrid,
                 self.map_topic,
                 self._map_callback,
-                10,
+                map_qos,
             )
         else:
             self.map_sub = None
@@ -296,7 +305,9 @@ class RobotTaskExecutorNode(Node):
             and self._pending_goal_task_id is not None
             and self._pending_goal_task_id == event.task_id
         ):
-            self._clear_pending_goal_tracking()
+            # Goal request has been sent but goal handle is not available yet.
+            # Defer cancellation and apply it immediately after goal response.
+            self._pending_cancel_task_ids.add(event.task_id)
 
     def _tick_callback(self) -> None:
         self._refresh_dispatch_readiness()
@@ -401,18 +412,35 @@ class RobotTaskExecutorNode(Node):
         )
 
     def _on_nav_goal_response(self, task_id: str, future: Any) -> None:
+        cancel_requested_while_pending = task_id in self._pending_cancel_task_ids
+        if cancel_requested_while_pending:
+            self._pending_cancel_task_ids.discard(task_id)
         self._clear_pending_goal_tracking()
-        if self.core.active_task_id != task_id:
-            return
 
         try:
             goal_handle = future.result()
         except Exception as exc:
-            self._mark_task_failed_if_active(task_id, f"Nav2 goal response failed: {exc}")
+            if self.core.active_task_id == task_id:
+                self._mark_task_failed_if_active(task_id, f"Nav2 goal response failed: {exc}")
             return
 
         if not goal_handle.accepted:
-            self._mark_task_failed_if_active(task_id, "Nav2 goal rejected by action server")
+            if self.core.active_task_id == task_id:
+                self._mark_task_failed_if_active(task_id, "Nav2 goal rejected by action server")
+            return
+
+        if cancel_requested_while_pending:
+            self._cancel_goal_handle(
+                goal_handle,
+                reason="operator command while waiting for goal response",
+            )
+            return
+
+        if self.core.active_task_id != task_id:
+            self._cancel_goal_handle(
+                goal_handle,
+                reason="task no longer active when goal response arrived",
+            )
             return
 
         self._active_goal_task_id = task_id
@@ -505,15 +533,17 @@ class RobotTaskExecutorNode(Node):
     def _cancel_active_nav_goal(self, reason: str) -> None:
         if self._active_goal_handle is None:
             return
+        self._cancel_goal_handle(self._active_goal_handle, reason=reason)
+        self._clear_active_goal_tracking()
+
+    def _cancel_goal_handle(self, goal_handle: Any, reason: str) -> None:
         try:
-            cancel_future = self._active_goal_handle.cancel_goal_async()
+            cancel_future = goal_handle.cancel_goal_async()
             cancel_future.add_done_callback(
                 lambda _: self.get_logger().info(f"Active goal cancel requested ({reason})")
             )
         except Exception as exc:
             self.get_logger().warning(f"Failed to request active goal cancel ({reason}): {exc}")
-        finally:
-            self._clear_active_goal_tracking()
 
     def _clear_active_goal_tracking(self) -> None:
         self._active_goal_handle = None
@@ -570,7 +600,8 @@ class RobotTaskExecutorNode(Node):
 
     def _refresh_dispatch_readiness(self) -> None:
         now_s = time.monotonic()
-        map_ready = self._is_fresh(self._last_map_msg_s, now_s, self.map_stale_timeout_s)
+        # Treat /map as latched static readiness: once a map is received, readiness stays true.
+        map_ready = self._last_map_msg_s is not None
         tf_latest_s: float | None = None
         if self._last_tf_msg_s is not None and self._last_tf_static_msg_s is not None:
             tf_latest_s = max(self._last_tf_msg_s, self._last_tf_static_msg_s)

@@ -52,6 +52,8 @@ else:
                 os.path.join(test_dir, "helpers", "fake_nav2_action_server.py"),
                 "--execute-delay-s",
                 "1.5",
+                "--goal-response-delay-s",
+                "0.7",
             ],
             name="fake_nav2_action_server",
             output="screen",
@@ -110,6 +112,7 @@ else:
             self._status_msgs: list[dict] = []
             self._alert_msgs: list[dict] = []
             self._state_msgs: list[dict] = []
+            self._nav_goal_events: list[dict] = []
 
             self.node = rclpy.create_node("executor_launch_test_client")
             self._executor = SingleThreadedExecutor()
@@ -138,6 +141,12 @@ else:
             )
             self.task_pub = self.node.create_publisher(String, "/reasoning/task_requests", 10)
             self.command_pub = self.node.create_publisher(String, "/ui/set_task_state", 10)
+            self.goal_events_sub = self.node.create_subscription(
+                String,
+                "/fake_nav2/goal_events",
+                self._on_goal_event,
+                50,
+            )
 
             # Allow publisher/subscriber graph to settle.
             time.sleep(0.3)
@@ -168,6 +177,11 @@ else:
             payload = _decode_json_message(msg.data)
             with self._lock:
                 self._state_msgs.append(payload)
+
+        def _on_goal_event(self, msg: String) -> None:
+            payload = _decode_json_message(msg.data)
+            with self._lock:
+                self._nav_goal_events.append(payload)
 
         def _publish_json(self, publisher: object, payload: dict) -> None:
             msg = String()
@@ -204,6 +218,15 @@ else:
                     return False
                 readiness = self._state_msgs[-1].get("readiness", {})
             return bool(readiness.get("nav_ready", False))
+
+        def _goal_events_for_target_x(self, target_x: float, tolerance: float = 0.001) -> list[str]:
+            with self._lock:
+                filtered = [
+                    item
+                    for item in self._nav_goal_events
+                    if abs(float(item.get("target_x", 0.0)) - float(target_x)) <= tolerance
+                ]
+            return [str(item.get("event", "")) for item in filtered]
 
         def test_autonomous_execution_reaches_succeeded(self) -> None:
             self._wait_for(
@@ -320,6 +343,49 @@ else:
                 timeout_s=8.0,
                 description="SUCCEEDED after resume",
             )
+
+        def test_stop_while_goal_response_pending_requests_nav_cancel(self) -> None:
+            self._wait_for(
+                lambda: self._latest_readiness_nav_ready(),
+                timeout_s=10.0,
+                description="nav action readiness true in executor_state",
+            )
+
+            task_id = "pending-cancel-1"
+            marker_x = 42.123
+            self._publish_json(
+                self.task_pub,
+                {
+                    "task_id": task_id,
+                    "task_type": "INSPECT_POI",
+                    "goal": {"frame_id": "map", "x": marker_x, "y": 0.0, "yaw": 0.0},
+                },
+            )
+            self._wait_for(
+                lambda: "DISPATCHED" in self._task_states(task_id),
+                timeout_s=5.0,
+                description="DISPATCHED before stop",
+            )
+            self._publish_json(
+                self.command_pub,
+                {
+                    "task_id": task_id,
+                    "command": "stop",
+                },
+            )
+            self._wait_for(
+                lambda: "CANCELED" in self._task_states(task_id),
+                timeout_s=5.0,
+                description="CANCELED status after stop",
+            )
+            self._wait_for(
+                lambda: "canceled" in self._goal_events_for_target_x(marker_x),
+                timeout_s=8.0,
+                description="fake nav2 canceled event for pending-cancel goal",
+            )
+            # Guard against regression where pending cancel is dropped and goal succeeds.
+            time.sleep(1.0)
+            self.assertNotIn("succeeded", self._goal_events_for_target_x(marker_x))
 
 
     @launch_testing.post_shutdown_test()
