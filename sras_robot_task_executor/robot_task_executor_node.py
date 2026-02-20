@@ -121,7 +121,7 @@ class RobotTaskExecutorNode(Node):
         self._last_tf_static_msg_s: float | None = None
         self._pending_goal_task_id: str | None = None
         self._pending_goal_future = None
-        self._pending_cancel_task_ids: set[str] = set()
+        self._pending_cancel_requested = False
         self._active_goal_task_id: str | None = None
         self._active_goal_handle = None
         self._active_goal_sent_s: float | None = None
@@ -307,7 +307,7 @@ class RobotTaskExecutorNode(Node):
         ):
             # Goal request has been sent but goal handle is not available yet.
             # Defer cancellation and apply it immediately after goal response.
-            self._pending_cancel_task_ids.add(event.task_id)
+            self._pending_cancel_requested = True
 
     def _tick_callback(self) -> None:
         self._refresh_dispatch_readiness()
@@ -406,27 +406,40 @@ class RobotTaskExecutorNode(Node):
 
         self._pending_goal_task_id = active_task.task_id
         self._pending_goal_future = send_goal_future
+        self._pending_cancel_requested = False
         self._active_goal_sent_s = time.monotonic()
         send_goal_future.add_done_callback(
             lambda future, task_id=active_task.task_id: self._on_nav_goal_response(task_id, future)
         )
 
     def _on_nav_goal_response(self, task_id: str, future: Any) -> None:
-        cancel_requested_while_pending = task_id in self._pending_cancel_task_ids
-        if cancel_requested_while_pending:
-            self._pending_cancel_task_ids.discard(task_id)
-        self._clear_pending_goal_tracking()
+        is_current_pending = (
+            self._pending_goal_task_id == task_id
+            and self._pending_goal_future is future
+        )
+        cancel_requested_while_pending = (
+            self._pending_cancel_requested if is_current_pending else False
+        )
+        if is_current_pending:
+            self._clear_pending_goal_tracking()
 
         try:
             goal_handle = future.result()
         except Exception as exc:
-            if self.core.active_task_id == task_id:
+            if is_current_pending and self.core.active_task_id == task_id:
                 self._mark_task_failed_if_active(task_id, f"Nav2 goal response failed: {exc}")
             return
 
         if not goal_handle.accepted:
-            if self.core.active_task_id == task_id:
+            if is_current_pending and self.core.active_task_id == task_id:
                 self._mark_task_failed_if_active(task_id, "Nav2 goal rejected by action server")
+            return
+
+        if not is_current_pending:
+            self._cancel_goal_handle(
+                goal_handle,
+                reason="stale goal response callback",
+            )
             return
 
         if cancel_requested_while_pending:
@@ -553,6 +566,7 @@ class RobotTaskExecutorNode(Node):
     def _clear_pending_goal_tracking(self) -> None:
         self._pending_goal_task_id = None
         self._pending_goal_future = None
+        self._pending_cancel_requested = False
         if self._active_goal_task_id is None:
             self._active_goal_sent_s = None
 

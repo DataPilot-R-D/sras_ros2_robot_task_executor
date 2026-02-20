@@ -387,6 +387,72 @@ else:
             time.sleep(1.0)
             self.assertNotIn("succeeded", self._goal_events_for_target_x(marker_x))
 
+        def test_pause_resume_before_first_goal_response_keeps_resumed_goal_valid(self) -> None:
+            self._wait_for(
+                lambda: self._latest_readiness_nav_ready(),
+                timeout_s=10.0,
+                description="nav action readiness true in executor_state",
+            )
+
+            task_id = "pending-pause-resume-1"
+            marker_x = 55.321
+            self._publish_json(
+                self.task_pub,
+                {
+                    "task_id": task_id,
+                    "task_type": "INSPECT_POI",
+                    "goal": {"frame_id": "map", "x": marker_x, "y": 0.0, "yaw": 0.0},
+                },
+            )
+            self._wait_for(
+                lambda: "DISPATCHED" in self._task_states(task_id),
+                timeout_s=5.0,
+                description="first DISPATCHED before pause",
+            )
+
+            # Pause before first goal response returns.
+            self._publish_json(
+                self.command_pub,
+                {
+                    "task_id": task_id,
+                    "command": "pause",
+                },
+            )
+            self._wait_for(
+                lambda: "PAUSED" in self._task_states(task_id),
+                timeout_s=5.0,
+                description="PAUSED after first dispatch",
+            )
+
+            self._publish_json(
+                self.command_pub,
+                {
+                    "task_id": task_id,
+                    "command": "resume",
+                },
+            )
+            self._wait_for(
+                lambda: self._task_states(task_id).count("DISPATCHED") >= 2,
+                timeout_s=6.0,
+                description="second DISPATCHED after resume",
+            )
+            self._wait_for(
+                lambda: "SUCCEEDED" in self._task_states(task_id),
+                timeout_s=10.0,
+                description="SUCCEEDED after pause/resume in pending window",
+            )
+            # Regression guard: at least one cancel (first goal) and one success (resumed goal).
+            self._wait_for(
+                lambda: "canceled" in self._goal_events_for_target_x(marker_x),
+                timeout_s=8.0,
+                description="fake nav2 canceled event for first paused goal",
+            )
+            self._wait_for(
+                lambda: "succeeded" in self._goal_events_for_target_x(marker_x),
+                timeout_s=8.0,
+                description="fake nav2 succeeded event for resumed goal",
+            )
+
 
     @launch_testing.post_shutdown_test()
     class TestExecutorLaunchShutdown(unittest.TestCase):
