@@ -30,3 +30,18 @@ or
 ```bash
 ros2 launch sras_robot_task_executor robot_task_executor.launch.py
 ```
+
+## Tests
+
+Fast unit tests (no ROS graph needed):
+
+```bash
+python3 -m unittest tests/test_execution_core.py -v
+```
+
+Launch integration tests (requires ROS 2 + launch_testing):
+
+```bash
+colcon test --packages-select sras_robot_task_executor --pytest-args -k executor_launch
+colcon test-result --verbose
+```
