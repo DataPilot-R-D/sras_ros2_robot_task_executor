@@ -1,0 +1,29 @@
+robot_task_executor_node:
+  ros__parameters:
+    task_request_topic: /reasoning/task_requests
+    task_status_topic: /robot/task_status
+    alerts_topic: /ui/alerts
+    executor_state_topic: ~/executor_state
+    set_task_state_topic: /ui/set_task_state
+
+    nav_to_pose_action: /navigate_to_pose
+    nav_through_poses_action: /navigate_through_poses
+    action_server_wait_timeout_s: 5.0
+    goal_timeout_s: 120.0
+    cancel_timeout_s: 5.0
+
+    executor_tick_hz: 2.0
+    max_queue_size: 100
+    max_active_tasks: 1
+    allow_preemption: false
+
+    require_map: true
+    map_stale_timeout_s: 5.0
+    require_tf: true
+    tf_stale_timeout_s: 2.0
+    require_nav_ready: true
+
+    publish_executor_state: true
+    journal_enabled: false
+    journal_path: data/executor_journal.db
+    use_json_transport_fallback: true
