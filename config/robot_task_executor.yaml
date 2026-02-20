@@ -18,8 +18,11 @@ robot_task_executor_node:
     allow_preemption: false
 
     require_map: true
+    map_topic: /map
     map_stale_timeout_s: 5.0
     require_tf: true
+    tf_topic: /tf
+    tf_static_topic: /tf_static
     tf_stale_timeout_s: 2.0
     require_nav_ready: true
 
