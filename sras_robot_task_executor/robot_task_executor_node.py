@@ -26,6 +26,7 @@ from sras_robot_task_executor.execution_core import (
     StatusEvent,
     TaskExecutionCore,
     TaskValidationError,
+    ValidatedTask,
 )
 
 ALERT_STATES = {
@@ -56,6 +57,8 @@ class RobotTaskExecutorNode(Node):
         self.declare_parameter("task_request_topic", "/reasoning/task_requests")
         self.declare_parameter("task_status_topic", "/robot/task_status")
         self.declare_parameter("alerts_topic", "/ui/alerts")
+        self.declare_parameter("security_reports_topic", "/reasoning/security_reports")
+        self.declare_parameter("security_events_topic", "/reasoning/security_events")
         self.declare_parameter("executor_state_topic", "~/executor_state")
         self.declare_parameter("set_task_state_topic", "/ui/set_task_state")
 
@@ -88,6 +91,8 @@ class RobotTaskExecutorNode(Node):
         self.task_request_topic = str(self.get_parameter("task_request_topic").value)
         self.task_status_topic = str(self.get_parameter("task_status_topic").value)
         self.alerts_topic = str(self.get_parameter("alerts_topic").value)
+        self.security_reports_topic = str(self.get_parameter("security_reports_topic").value)
+        self.security_events_topic = str(self.get_parameter("security_events_topic").value)
         self.executor_state_topic = str(self.get_parameter("executor_state_topic").value)
         self.set_task_state_topic = str(self.get_parameter("set_task_state_topic").value)
 
@@ -199,15 +204,24 @@ class RobotTaskExecutorNode(Node):
         )
         self.status_pub = self.create_publisher(String, self.task_status_topic, 10)
         self.alert_pub = self.create_publisher(String, self.alerts_topic, 10)
+        self.security_reports_pub = self.create_publisher(String, self.security_reports_topic, 10)
+        self.security_events_sub = self.create_subscription(
+            String,
+            self.security_events_topic,
+            self._security_event_callback,
+            10,
+        )
         self.state_pub = self.create_publisher(String, self.executor_state_topic, 10)
         self.stats_srv = self.create_service(Trigger, "~/get_stats", self._get_stats_callback)
         self.tick_timer = self.create_timer(1.0 / self.tick_hz, self._tick_callback)
 
     def _log_startup(self) -> None:
         self.get_logger().info("=" * 60)
-        self.get_logger().info("robot_task_executor_node scaffold started")
+        self.get_logger().info("robot_task_executor_node started")
         self.get_logger().info(f"task_request_topic: {self.task_request_topic}")
         self.get_logger().info(f"task_status_topic: {self.task_status_topic}")
+        self.get_logger().info(f"security_reports_topic: {self.security_reports_topic}")
+        self.get_logger().info(f"security_events_topic: {self.security_events_topic}")
         self.get_logger().info(f"nav_to_pose_action: {self.nav_to_pose_action}")
         self.get_logger().info(f"require_map: {self.require_map} (topic={self.map_topic})")
         self.get_logger().info(f"require_tf: {self.require_tf} (topic={self.tf_topic})")
@@ -368,6 +382,10 @@ class RobotTaskExecutorNode(Node):
         if active_task is None:
             return
 
+        if active_task.nav_action == "publish_report":
+            self._execute_report_task(active_task)
+            return
+
         try:
             if active_task.nav_action == "navigate_to_pose":
                 goal_msg = NavigateToPose.Goal()
@@ -411,6 +429,25 @@ class RobotTaskExecutorNode(Node):
         send_goal_future.add_done_callback(
             lambda future, task_id=active_task.task_id: self._on_nav_goal_response(task_id, future)
         )
+
+    def _execute_report_task(self, active_task: ValidatedTask) -> None:
+        report_payload = {
+            "task_id": active_task.task_id,
+            "incident_key": str(active_task.raw_payload.get("incident_key", "")),
+            "task_type": active_task.task_type,
+            "report_data": active_task.raw_payload.get("report_data", {}),
+            "status": "completed",
+            "timestamp_s": time.time(),
+        }
+        report_msg = String()
+        report_msg.data = json.dumps(report_payload)
+        self.security_reports_pub.publish(report_msg)
+
+        try:
+            event = self.core.mark_terminal("SUCCEEDED", "Report published")
+        except CommandRejectedError:
+            return
+        self._publish_event(event)
 
     def _on_nav_goal_response(self, task_id: str, future: Any) -> None:
         is_current_pending = (
@@ -611,6 +648,31 @@ class RobotTaskExecutorNode(Node):
     def _tf_static_callback(self, msg: TFMessage) -> None:
         del msg
         self._last_tf_static_msg_s = time.monotonic()
+
+    def _security_event_callback(self, msg: String) -> None:
+        payload = self._safe_parse_json(msg.data)
+        if payload is None:
+            self._publish_alert(
+                task_id="",
+                state="INFO",
+                detail="Received security event with invalid JSON payload",
+                severity="warning",
+            )
+            return
+
+        incident_key = str(payload.get("incident_key", "")).strip()
+        task_id = str(payload.get("task_id", "")).strip()
+        detail = (
+            f"Security event received for incident_key={incident_key}"
+            if incident_key
+            else "Security event received"
+        )
+        self._publish_alert(
+            task_id=task_id,
+            state="INFO",
+            detail=detail,
+            severity="info",
+        )
 
     def _refresh_dispatch_readiness(self) -> None:
         now_s = time.monotonic()

@@ -3,6 +3,8 @@ robot_task_executor_node:
     task_request_topic: /reasoning/task_requests
     task_status_topic: /robot/task_status
     alerts_topic: /ui/alerts
+    security_reports_topic: /reasoning/security_reports
+    security_events_topic: /reasoning/security_events
     executor_state_topic: ~/executor_state
     set_task_state_topic: /ui/set_task_state
 

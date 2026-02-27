@@ -27,6 +27,15 @@ def _patrol_task(task_id: str) -> dict:
     }
 
 
+def _report_task(task_id: str) -> dict:
+    return {
+        "task_id": task_id,
+        "task_type": "REPORT",
+        "incident_key": "incident-1",
+        "report_data": {"summary": "all clear"},
+    }
+
+
 class TaskExecutionCoreTests(unittest.TestCase):
     def test_rejects_unknown_task_type(self) -> None:
         core = TaskExecutionCore(max_queue_size=2, allow_preemption=False)
@@ -53,6 +62,38 @@ class TaskExecutionCoreTests(unittest.TestCase):
         dispatched = core.dispatch_next()
         self.assertIsNotNone(dispatched)
         self.assertEqual(dispatched.state, "DISPATCHED")
+
+    def test_investigate_alert_maps_to_navigate_to_pose(self) -> None:
+        core = TaskExecutionCore(max_queue_size=2, allow_preemption=False)
+        core.enqueue_task(
+            {
+                "task_id": "investigate-1",
+                "task_type": "INVESTIGATE_ALERT",
+                "goal": {"frame_id": "map", "x": 1.0, "y": 1.0, "yaw": 0.0},
+            }
+        )
+        event = core.dispatch_next()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.task_id, "investigate-1")
+        self.assertEqual(event.nav_action, "navigate_to_pose")
+
+    def test_report_task_type_maps_to_publish_report(self) -> None:
+        core = TaskExecutionCore(max_queue_size=2, allow_preemption=False)
+        core.enqueue_task(_report_task("report-1"))
+        event = core.dispatch_next()
+        self.assertIsNotNone(event)
+        self.assertEqual(event.task_id, "report-1")
+        self.assertEqual(event.nav_action, "publish_report")
+
+    def test_report_task_requires_report_data_field(self) -> None:
+        core = TaskExecutionCore(max_queue_size=2, allow_preemption=False)
+        with self.assertRaises(TaskValidationError):
+            core.enqueue_task(
+                {
+                    "task_id": "report-1",
+                    "task_type": "REPORT",
+                }
+            )
 
     def test_queue_is_bounded(self) -> None:
         core = TaskExecutionCore(max_queue_size=2, allow_preemption=False)
