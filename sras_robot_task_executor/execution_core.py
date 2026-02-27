@@ -12,7 +12,9 @@ from uuid import uuid4
 TASK_TYPE_TO_NAV_ACTION = {
     "INSPECT_POI": "navigate_to_pose",
     "INSPECT_BLINDSPOT": "navigate_to_pose",
+    "INVESTIGATE_ALERT": "navigate_to_pose",
     "PATROL_ROUTE": "navigate_through_poses",
+    "REPORT": "publish_report",
 }
 
 TERMINAL_STATES = {"SUCCEEDED", "FAILED", "CANCELED"}
@@ -270,6 +272,11 @@ class TaskExecutionCore:
             if not isinstance(poses, list) or not poses:
                 self._stats["tasks_invalid"] += 1
                 raise TaskValidationError("navigate_through_poses requires non-empty list: poses")
+        elif nav_action == "publish_report":
+            report_data = raw_task.get("report_data")
+            if not isinstance(report_data, dict):
+                self._stats["tasks_invalid"] += 1
+                raise TaskValidationError("publish_report requires object field: report_data")
 
         return ValidatedTask(
             task_id=task_id,
