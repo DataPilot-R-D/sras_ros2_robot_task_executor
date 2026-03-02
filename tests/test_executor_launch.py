@@ -68,7 +68,7 @@ else:
                 {
                     "task_request_topic": "/reasoning/task_requests",
                     "task_status_topic": "/robot/task_status",
-                    "alerts_topic": "/ui/alerts",
+
                     "executor_state_topic": "/executor_state",
                     "set_task_state_topic": "/ui/set_task_state",
                     "executor_tick_hz": 20.0,
@@ -110,7 +110,7 @@ else:
         def setUp(self) -> None:
             self._lock = threading.Lock()
             self._status_msgs: list[dict] = []
-            self._alert_msgs: list[dict] = []
+
             self._state_msgs: list[dict] = []
             self._nav_goal_events: list[dict] = []
 
@@ -127,12 +127,7 @@ else:
                 self._on_status,
                 50,
             )
-            self.alert_sub = self.node.create_subscription(
-                String,
-                "/ui/alerts",
-                self._on_alert,
-                50,
-            )
+
             self.state_sub = self.node.create_subscription(
                 String,
                 "/executor_state",
@@ -168,10 +163,6 @@ else:
             with self._lock:
                 self._status_msgs.append(payload)
 
-        def _on_alert(self, msg: String) -> None:
-            payload = _decode_json_message(msg.data)
-            with self._lock:
-                self._alert_msgs.append(payload)
 
         def _on_state(self, msg: String) -> None:
             payload = _decode_json_message(msg.data)
@@ -204,13 +195,6 @@ else:
                     if str(item.get("task_id", "")) == task_id
                 ]
 
-        def _alert_states(self, task_id: str) -> list[str]:
-            with self._lock:
-                return [
-                    str(item.get("state", ""))
-                    for item in self._alert_msgs
-                    if str(item.get("task_id", "")) == task_id
-                ]
 
         def _latest_readiness_nav_ready(self) -> bool:
             with self._lock:
@@ -299,11 +283,6 @@ else:
                 lambda: "PAUSED" in self._task_states(task_id),
                 timeout_s=5.0,
                 description="PAUSED status",
-            )
-            self._wait_for(
-                lambda: "PAUSED" in self._alert_states(task_id),
-                timeout_s=5.0,
-                description="PAUSED alert",
             )
 
             self._publish_json(

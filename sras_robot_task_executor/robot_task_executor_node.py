@@ -34,14 +34,6 @@ from sras_robot_task_executor.execution_core import (
     ValidatedTask,
 )
 
-ALERT_STATES = {
-    "BLOCKED",
-    "FAILED",
-    "CANCELED",
-    "PAUSED",
-    "REDEFINED",
-    "REJECTED",
-}
 
 NOTIFIABLE_STATES = {
     "QUEUED",
@@ -71,7 +63,7 @@ class RobotTaskExecutorNode(Node):
     def _declare_parameters(self) -> None:
         self.declare_parameter("task_request_topic", "/reasoning/task_requests")
         self.declare_parameter("task_status_topic", "/robot/task_status")
-        self.declare_parameter("alerts_topic", "/ui/alerts")
+
         self.declare_parameter("security_reports_topic", "/reasoning/security_reports")
         self.declare_parameter("security_events_topic", "/reasoning/security_events")
         self.declare_parameter("executor_state_topic", "~/executor_state")
@@ -106,7 +98,7 @@ class RobotTaskExecutorNode(Node):
     def _load_config(self) -> None:
         self.task_request_topic = str(self.get_parameter("task_request_topic").value)
         self.task_status_topic = str(self.get_parameter("task_status_topic").value)
-        self.alerts_topic = str(self.get_parameter("alerts_topic").value)
+
         self.security_reports_topic = str(self.get_parameter("security_reports_topic").value)
         self.security_events_topic = str(self.get_parameter("security_events_topic").value)
         self.executor_state_topic = str(self.get_parameter("executor_state_topic").value)
@@ -222,7 +214,7 @@ class RobotTaskExecutorNode(Node):
             10,
         )
         self.status_pub = self.create_publisher(String, self.task_status_topic, 10)
-        self.alert_pub = self.create_publisher(String, self.alerts_topic, 10)
+
         self.security_reports_pub = self.create_publisher(String, self.security_reports_topic, 10)
         self.security_events_sub = self.create_subscription(
             String,
@@ -266,12 +258,6 @@ class RobotTaskExecutorNode(Node):
                 detail="Invalid JSON task request",
                 progress=0.0,
             )
-            self._publish_alert(
-                task_id="",
-                state="FAILED",
-                detail="Invalid JSON task request payload",
-                severity="warning",
-            )
             return
 
         try:
@@ -283,12 +269,6 @@ class RobotTaskExecutorNode(Node):
                 state="FAILED",
                 detail=f"Task rejected: {exc}",
                 progress=0.0,
-            )
-            self._publish_alert(
-                task_id=task_id,
-                state="FAILED",
-                detail=f"Task rejected: {exc}",
-                severity="warning",
             )
             return
 
@@ -303,12 +283,6 @@ class RobotTaskExecutorNode(Node):
                 detail="Invalid JSON command payload",
                 progress=0.0,
             )
-            self._publish_alert(
-                task_id="",
-                state="REJECTED",
-                detail="Invalid JSON command payload",
-                severity="warning",
-            )
             return
 
         command = str(payload.get("command", "")).strip().lower()
@@ -321,12 +295,6 @@ class RobotTaskExecutorNode(Node):
                 state="REJECTED",
                 detail=f"Command rejected: {exc}",
                 progress=0.0,
-            )
-            self._publish_alert(
-                task_id=str(payload.get("task_id", "")).strip(),
-                state="REJECTED",
-                detail=f"Command rejected: {exc}",
-                severity="warning",
             )
             return
 
@@ -375,13 +343,6 @@ class RobotTaskExecutorNode(Node):
             detail=event.detail,
             progress=event.progress,
         )
-        if event.state in ALERT_STATES:
-            self._publish_alert(
-                task_id=event.task_id,
-                state=event.state,
-                detail=event.detail,
-                severity=self._severity_for_state(event.state),
-            )
         if event.state in NOTIFIABLE_STATES:
             self._publish_dashboard_notification(
                 category="task_state_changed",
@@ -392,24 +353,6 @@ class RobotTaskExecutorNode(Node):
                 metadata={"to_state": event.state},
             )
 
-    def _publish_alert(self, task_id: str, state: str, detail: str, severity: str) -> None:
-        msg = String()
-        msg.data = json.dumps(
-            {
-                "task_id": task_id,
-                "state": state,
-                "severity": severity,
-                "detail": detail,
-                "timestamp_s": time.time(),
-            }
-        )
-        self.alert_pub.publish(msg)
-
-    @staticmethod
-    def _severity_for_state(state: str) -> str:
-        if state in {"FAILED", "BLOCKED", "REJECTED"}:
-            return "warning"
-        return "info"
 
     @staticmethod
     def _notif_level_for_state(state: str) -> str:
@@ -740,27 +683,16 @@ class RobotTaskExecutorNode(Node):
     def _security_event_callback(self, msg: String) -> None:
         payload = self._safe_parse_json(msg.data)
         if payload is None:
-            self._publish_alert(
-                task_id="",
-                state="INFO",
-                detail="Received security event with invalid JSON payload",
-                severity="warning",
-            )
+            self.get_logger().warn("Received security event with invalid JSON payload")
             return
 
         incident_key = str(payload.get("incident_key", "")).strip()
-        task_id = str(payload.get("task_id", "")).strip()
         detail = (
             f"Security event received for incident_key={incident_key}"
             if incident_key
             else "Security event received"
         )
-        self._publish_alert(
-            task_id=task_id,
-            state="INFO",
-            detail=detail,
-            severity="info",
-        )
+        self.get_logger().info(detail)
 
     def _refresh_dispatch_readiness(self) -> None:
         now_s = time.monotonic()
