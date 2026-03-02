@@ -20,6 +20,11 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
 
+from sras_robot_task_executor.dashboard_notifications import (
+    NotificationThrottle,
+    ThrottleConfig,
+    build_notification,
+)
 from sras_robot_task_executor.execution_core import (
     CommandRejectedError,
     QueueFullError,
@@ -36,6 +41,16 @@ ALERT_STATES = {
     "PAUSED",
     "REDEFINED",
     "REJECTED",
+}
+
+NOTIFIABLE_STATES = {
+    "QUEUED",
+    "DISPATCHED",
+    "ACTIVE",
+    "PAUSED",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELED",
 }
 
 
@@ -86,6 +101,7 @@ class RobotTaskExecutorNode(Node):
         self.declare_parameter("journal_enabled", False)
         self.declare_parameter("journal_path", "data/executor_journal.db")
         self.declare_parameter("use_json_transport_fallback", True)
+        self.declare_parameter("dashboard_notifications_topic", "/ui/dashboard_notifications")
 
     def _load_config(self) -> None:
         self.task_request_topic = str(self.get_parameter("task_request_topic").value)
@@ -118,6 +134,9 @@ class RobotTaskExecutorNode(Node):
         self.require_nav_ready = bool(self.get_parameter("require_nav_ready").value)
         self.use_json_transport_fallback = bool(
             self.get_parameter("use_json_transport_fallback").value
+        )
+        self.dashboard_notifications_topic = str(
+            self.get_parameter("dashboard_notifications_topic").value
         )
 
     def _setup_ros(self) -> None:
@@ -212,6 +231,12 @@ class RobotTaskExecutorNode(Node):
             10,
         )
         self.state_pub = self.create_publisher(String, self.executor_state_topic, 10)
+        self.dashboard_notif_pub = self.create_publisher(
+            String, self.dashboard_notifications_topic, 10,
+        )
+        self._notif_throttle = NotificationThrottle(
+            config=ThrottleConfig(), now_fn=time.time,
+        )
         self.stats_srv = self.create_service(Trigger, "~/get_stats", self._get_stats_callback)
         self.tick_timer = self.create_timer(1.0 / self.tick_hz, self._tick_callback)
 
@@ -357,6 +382,15 @@ class RobotTaskExecutorNode(Node):
                 detail=event.detail,
                 severity=self._severity_for_state(event.state),
             )
+        if event.state in NOTIFIABLE_STATES:
+            self._publish_dashboard_notification(
+                category="task_state_changed",
+                level=self._notif_level_for_state(event.state),
+                title=f"Task {event.state.capitalize()}",
+                message=f"Task {event.task_id}: {event.detail}",
+                task_id=event.task_id,
+                metadata={"to_state": event.state},
+            )
 
     def _publish_alert(self, task_id: str, state: str, detail: str, severity: str) -> None:
         msg = String()
@@ -376,6 +410,43 @@ class RobotTaskExecutorNode(Node):
         if state in {"FAILED", "BLOCKED", "REJECTED"}:
             return "warning"
         return "info"
+
+    @staticmethod
+    def _notif_level_for_state(state: str) -> str:
+        if state in {"FAILED", "CANCELED"}:
+            return "error"
+        if state == "SUCCEEDED":
+            return "success"
+        if state == "PAUSED":
+            return "warning"
+        return "info"
+
+    def _publish_dashboard_notification(
+        self,
+        *,
+        category: str,
+        level: str,
+        title: str,
+        message: str,
+        task_id: str = "",
+        incident_key: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        notif = build_notification(
+            category=category,
+            level=level,
+            title=title,
+            message=message,
+            task_id=task_id,
+            incident_key=incident_key,
+            metadata=metadata,
+            now_fn=time.time,
+        )
+        if not self._notif_throttle.should_publish(notif):
+            return
+        ros_msg = String()
+        ros_msg.data = notif.to_json()
+        self.dashboard_notif_pub.publish(ros_msg)
 
     def _dispatch_active_task_to_nav(self) -> None:
         active_task = self.core.active_task
@@ -545,6 +616,14 @@ class RobotTaskExecutorNode(Node):
             state="ACTIVE",
             detail=detail,
             progress=0.0,
+        )
+        self._publish_dashboard_notification(
+            category="robot_action_monitor",
+            level="info",
+            title="Navigation Progress",
+            message=detail,
+            task_id=task_id,
+            metadata={"nav_detail": detail},
         )
 
     def _mark_task_failed_if_active(self, task_id: str, detail: str) -> None:
