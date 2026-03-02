@@ -432,21 +432,30 @@ class RobotTaskExecutorNode(Node):
         incident_key: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        notif = build_notification(
-            category=category,
-            level=level,
-            title=title,
-            message=message,
-            task_id=task_id,
-            incident_key=incident_key,
-            metadata=metadata,
-            now_fn=time.time,
-        )
-        if not self._notif_throttle.should_publish(notif):
-            return
-        ros_msg = String()
-        ros_msg.data = notif.to_json()
-        self.dashboard_notif_pub.publish(ros_msg)
+        try:
+            notif = build_notification(
+                category=category,
+                level=level,
+                title=title,
+                message=message,
+                task_id=task_id,
+                incident_key=incident_key,
+                metadata=metadata,
+                now_fn=time.time,
+            )
+            if not self._notif_throttle.should_publish(notif):
+                self.get_logger().debug(
+                    f"Throttled notification category={category} task_id={task_id}"
+                )
+                return
+            ros_msg = String()
+            ros_msg.data = notif.to_json()
+            self.dashboard_notif_pub.publish(ros_msg)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to publish dashboard notification "
+                f"category={category} task_id={task_id}: {exc}"
+            )
 
     def _dispatch_active_task_to_nav(self) -> None:
         active_task = self.core.active_task

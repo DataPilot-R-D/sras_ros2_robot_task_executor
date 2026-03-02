@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,16 +37,19 @@ class DashboardNotification:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
-        return json.dumps({
-            "category": self.category,
-            "level": self.level,
-            "title": self.title,
-            "message": self.message,
-            "task_id": self.task_id,
-            "incident_key": self.incident_key,
-            "timestamp_s": self.timestamp_s,
-            "metadata": self.metadata,
-        })
+        return json.dumps(
+            {
+                "category": self.category,
+                "level": self.level,
+                "title": self.title,
+                "message": self.message,
+                "task_id": self.task_id,
+                "incident_key": self.incident_key,
+                "timestamp_s": self.timestamp_s,
+                "metadata": self.metadata,
+            },
+            default=str,
+        )
 
 
 def build_notification(
@@ -57,7 +61,7 @@ def build_notification(
     task_id: str = "",
     incident_key: str = "",
     metadata: dict[str, Any] | None = None,
-    now_fn: Any = None,
+    now_fn: Callable[[], float] | None = None,
 ) -> DashboardNotification:
     """Factory that stamps the notification with the current time."""
     ts = (now_fn or time.time)()
@@ -109,7 +113,10 @@ def _throttle_key(notification: DashboardNotification) -> str:
     if cat == "plan_scheduled":
         return f"{cat}:{notification.task_id}"
     if cat == "task_state_changed":
-        to_state = notification.metadata.get("to_state", "")
+        meta = notification.metadata if notification.metadata is not None else {}
+        to_state = meta.get("to_state", "")
+        if not to_state:
+            return f"{cat}:{notification.task_id}"
         return f"{cat}:{notification.task_id}:{to_state}"
     if cat == "robot_action_monitor":
         return f"{cat}:{notification.task_id}"
@@ -123,7 +130,7 @@ class NotificationThrottle:
     def __init__(
         self,
         config: ThrottleConfig | None = None,
-        now_fn: Any = None,
+        now_fn: Callable[[], float] | None = None,
     ) -> None:
         self._config = config or ThrottleConfig()
         self._now_fn = now_fn or time.time
@@ -141,17 +148,26 @@ class NotificationThrottle:
         )
 
         last_ts = self._last_published.get(key)
-        if last_ts is not None and (now - last_ts) < window:
-            return False
+        if last_ts is not None:
+            elapsed = now - last_ts
+            if elapsed < 0:
+                # Clock jumped backward (NTP correction); reset entry.
+                self._last_published = {
+                    k: v for k, v in self._last_published.items() if k != key
+                }
+            elif elapsed < window:
+                return False
 
-        self._last_published[key] = now
+        self._last_published = {**self._last_published, key: now}
         return True
 
     def _cleanup_if_needed(self) -> None:
         """Evict oldest entries when the dict exceeds *max_entries*."""
         if len(self._last_published) <= self._config.max_entries:
             return
-        sorted_keys = sorted(self._last_published, key=self._last_published.get)  # type: ignore[arg-type]
-        to_remove = len(self._last_published) - self._config.max_entries
-        for k in sorted_keys[:to_remove]:
-            del self._last_published[k]
+        sorted_keys = sorted(
+            self._last_published,
+            key=lambda k: self._last_published.get(k, 0.0),
+        )
+        keys_to_keep = sorted_keys[len(self._last_published) - self._config.max_entries :]
+        self._last_published = {k: self._last_published[k] for k in keys_to_keep}
