@@ -369,20 +369,8 @@ class RobotTaskExecutorNode(Node):
         self._publish_event(event)
         if event.state == "DISPATCHED":
             self._dispatch_active_task_to_nav()
-        if (
-            normalized_command in {"cancel", "pause"}
-            and self._active_goal_task_id is not None
-            and self._active_goal_task_id == event.task_id
-        ):
-            self._cancel_active_nav_goal(reason=f"operator command: {normalized_command}")
-        if (
-            normalized_command in {"cancel", "pause"}
-            and self._pending_goal_task_id is not None
-            and self._pending_goal_task_id == event.task_id
-        ):
-            # Goal request has been sent but goal handle is not available yet.
-            # Defer cancellation and apply it immediately after goal response.
-            self._pending_cancel_requested = True
+        if normalized_command in {"cancel", "pause"}:
+            self._cancel_goals_for_task(event.task_id, normalized_command)
 
     def _tick_callback(self) -> None:
         self._refresh_dispatch_readiness()
@@ -719,7 +707,13 @@ class RobotTaskExecutorNode(Node):
         self.security_reports_pub.publish(report_msg)
 
         try:
-            event = self.core.mark_terminal("SUCCEEDED", "Report published")
+            robot_id = active_task.robot_id
+            if robot_id and self._multi_core is not None:
+                event = self._multi_core.mark_terminal(
+                    robot_id, "SUCCEEDED", "Report published",
+                )
+            else:
+                event = self.core.mark_terminal("SUCCEEDED", "Report published")
         except CommandRejectedError:
             return
         self._publish_event(event)
@@ -897,6 +891,34 @@ class RobotTaskExecutorNode(Node):
                 self._publish_event(event)
             except CommandRejectedError:
                 pass
+
+    def _cancel_goals_for_task(self, task_id: str, command: str) -> None:
+        """Cancel Nav2 goals for the given task across single- and multi-robot tracking."""
+        reason = f"operator command: {command}"
+
+        # Single-robot tracking
+        if (
+            self._active_goal_task_id is not None
+            and self._active_goal_task_id == task_id
+        ):
+            self._cancel_active_nav_goal(reason=reason)
+        if (
+            self._pending_goal_task_id is not None
+            and self._pending_goal_task_id == task_id
+        ):
+            self._pending_cancel_requested = True
+
+        # Multi-robot tracking
+        for rid, goal_state in self._per_robot_goal_state.items():
+            if goal_state.get("active_task_id") == task_id:
+                goal_handle = goal_state.get("active_goal_handle")
+                if goal_handle is not None:
+                    self._cancel_goal_handle(goal_handle, reason=f"{reason} (robot {rid})")
+                goal_state["active_goal_handle"] = None
+                goal_state["active_task_id"] = None
+                goal_state["goal_sent_s"] = None
+            elif goal_state.get("pending_task_id") == task_id:
+                goal_state["cancel_requested"] = True
 
     def _cancel_active_nav_goal(self, reason: str) -> None:
         if self._active_goal_handle is None:
