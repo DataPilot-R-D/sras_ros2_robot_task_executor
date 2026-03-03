@@ -150,33 +150,26 @@ class RobotTaskExecutorNode(Node):
 
         self._multi_core: MultiRobotExecutionCore | None = None
         self._per_robot_nav_clients: dict[str, dict[str, ActionClient]] = {}
+        self._per_robot_goal_state: dict[str, dict[str, Any]] = {}
+
+        core_kwargs = {
+            "max_queue_size": self.max_queue_size,
+            "allow_preemption": self.allow_preemption,
+            "require_map": self.require_map,
+            "require_tf": self.require_tf,
+            "require_nav_ready": self.require_nav_ready,
+        }
 
         if self.multi_robot_enabled:
             robot_ids = self._load_robot_ids()
             self._multi_core = MultiRobotExecutionCore(
                 robot_ids=robot_ids,
-                max_queue_size=self.max_queue_size,
-                allow_preemption=self.allow_preemption,
-                require_map=self.require_map,
-                require_tf=self.require_tf,
-                require_nav_ready=self.require_nav_ready,
+                **core_kwargs,
             )
-            self.core = TaskExecutionCore(
-                max_queue_size=self.max_queue_size,
-                allow_preemption=self.allow_preemption,
-                require_map=self.require_map,
-                require_tf=self.require_tf,
-                require_nav_ready=self.require_nav_ready,
-            )
+            self.core = self._multi_core._fallback_core
             self._setup_per_robot_nav_clients(robot_ids)
         else:
-            self.core = TaskExecutionCore(
-                max_queue_size=self.max_queue_size,
-                allow_preemption=self.allow_preemption,
-                require_map=self.require_map,
-                require_tf=self.require_tf,
-                require_nav_ready=self.require_nav_ready,
-            )
+            self.core = TaskExecutionCore(**core_kwargs)
 
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, self.nav_to_pose_action)
         self.nav_through_poses_client = ActionClient(
@@ -267,8 +260,10 @@ class RobotTaskExecutorNode(Node):
             raw = self.get_parameter("robot_ids").value
             if isinstance(raw, list):
                 return [str(r) for r in raw]
-        except Exception:
-            pass
+        except Exception as exc:
+            self.get_logger().warning(
+                f"Failed to load robot_ids parameter, using defaults: {exc}"
+            )
         return ["robot0", "robot1"]
 
     def _setup_per_robot_nav_clients(self, robot_ids: list[str]) -> None:
@@ -278,8 +273,11 @@ class RobotTaskExecutorNode(Node):
             try:
                 self.declare_parameter(to_pose_param, f"/{rid}/navigate_to_pose")
                 self.declare_parameter(through_poses_param, f"/{rid}/navigate_through_poses")
-            except Exception:
-                pass
+            except Exception as exc:
+                self.get_logger().warning(
+                    f"Parameter declaration for {rid} Nav2 actions failed "
+                    f"(may already be declared): {exc}"
+                )
 
             to_pose_action = str(self.get_parameter(to_pose_param).value)
             through_poses_action = str(self.get_parameter(through_poses_param).value)
@@ -599,13 +597,113 @@ class RobotTaskExecutorNode(Node):
                 pass
             return
 
-        self._pending_goal_task_id = active_task.task_id
-        self._pending_goal_future = send_goal_future
-        self._pending_cancel_requested = False
-        self._active_goal_sent_s = time.monotonic()
+        self._per_robot_goal_state[robot_id] = {
+            "pending_task_id": active_task.task_id,
+            "pending_future": send_goal_future,
+            "cancel_requested": False,
+            "active_goal_handle": None,
+            "active_task_id": None,
+            "goal_sent_s": time.monotonic(),
+        }
         send_goal_future.add_done_callback(
-            lambda future, task_id=active_task.task_id: self._on_nav_goal_response(task_id, future)
+            lambda future, rid=robot_id, task_id=active_task.task_id: (
+                self._on_multi_robot_goal_response(rid, task_id, future)
+            )
         )
+
+    def _on_multi_robot_goal_response(
+        self, robot_id: str, task_id: str, future: Any,
+    ) -> None:
+        if self._multi_core is None:
+            return
+
+        goal_state = self._per_robot_goal_state.get(robot_id, {})
+        is_current = (
+            goal_state.get("pending_task_id") == task_id
+            and goal_state.get("pending_future") is future
+        )
+        cancel_requested = goal_state.get("cancel_requested", False) if is_current else False
+
+        if is_current:
+            goal_state["pending_task_id"] = None
+            goal_state["pending_future"] = None
+            goal_state["cancel_requested"] = False
+
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            if is_current:
+                try:
+                    event = self._multi_core.mark_terminal(
+                        robot_id, "FAILED", f"Nav2 goal response failed: {exc}",
+                    )
+                    self._publish_event(event)
+                except CommandRejectedError:
+                    pass
+            return
+
+        if not goal_handle.accepted:
+            if is_current:
+                try:
+                    event = self._multi_core.mark_terminal(
+                        robot_id, "FAILED", "Nav2 goal rejected by action server",
+                    )
+                    self._publish_event(event)
+                except CommandRejectedError:
+                    pass
+            return
+
+        if not is_current or cancel_requested:
+            self._cancel_goal_handle(
+                goal_handle,
+                reason="stale or canceled multi-robot goal" if not is_current else "operator cancel",
+            )
+            return
+
+        goal_state["active_goal_handle"] = goal_handle
+        goal_state["active_task_id"] = task_id
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda res_fut, rid=robot_id, tid=task_id: (
+                self._on_multi_robot_nav_result(rid, tid, res_fut)
+            )
+        )
+        try:
+            event = self._multi_core.mark_active(robot_id)
+            self._publish_event(event)
+        except CommandRejectedError:
+            pass
+
+    def _on_multi_robot_nav_result(
+        self, robot_id: str, task_id: str, result_future: Any,
+    ) -> None:
+        if self._multi_core is None:
+            return
+
+        goal_state = self._per_robot_goal_state.get(robot_id, {})
+        if goal_state.get("active_task_id") == task_id:
+            goal_state["active_goal_handle"] = None
+            goal_state["active_task_id"] = None
+            goal_state["goal_sent_s"] = None
+
+        try:
+            wrapped_result = result_future.result()
+        except Exception as exc:
+            try:
+                event = self._multi_core.mark_terminal(
+                    robot_id, "FAILED", f"Nav2 result failed: {exc}",
+                )
+                self._publish_event(event)
+            except CommandRejectedError:
+                pass
+            return
+
+        terminal_state, detail = self._map_nav_result_status(wrapped_result.status)
+        try:
+            event = self._multi_core.mark_terminal(robot_id, terminal_state, detail)
+            self._publish_event(event)
+        except CommandRejectedError:
+            pass
 
     def _execute_report_task(self, active_task: ValidatedTask) -> None:
         report_payload = {
@@ -743,6 +841,10 @@ class RobotTaskExecutorNode(Node):
         self._publish_event(event)
 
     def _enforce_goal_timeout(self) -> None:
+        self._enforce_single_robot_goal_timeout()
+        self._enforce_multi_robot_goal_timeouts()
+
+    def _enforce_single_robot_goal_timeout(self) -> None:
         if self.core.active_task_id is None:
             return
         if self._active_goal_sent_s is None:
@@ -764,6 +866,37 @@ class RobotTaskExecutorNode(Node):
         except CommandRejectedError:
             return
         self._publish_event(timeout_event)
+
+    def _enforce_multi_robot_goal_timeouts(self) -> None:
+        if self._multi_core is None:
+            return
+
+        now = time.monotonic()
+        for rid, goal_state in list(self._per_robot_goal_state.items()):
+            sent_s = goal_state.get("goal_sent_s")
+            if sent_s is None:
+                continue
+            if (now - sent_s) < self.goal_timeout_s:
+                continue
+
+            goal_handle = goal_state.get("active_goal_handle")
+            if goal_handle is not None:
+                self._cancel_goal_handle(
+                    goal_handle, reason=f"multi-robot goal timeout for {rid}",
+                )
+
+            goal_state["active_goal_handle"] = None
+            goal_state["active_task_id"] = None
+            goal_state["goal_sent_s"] = None
+
+            try:
+                event = self._multi_core.mark_terminal(
+                    rid, "FAILED",
+                    f"Goal timeout exceeded after {self.goal_timeout_s:.1f}s",
+                )
+                self._publish_event(event)
+            except CommandRejectedError:
+                pass
 
     def _cancel_active_nav_goal(self, reason: str) -> None:
         if self._active_goal_handle is None:
@@ -899,9 +1032,8 @@ class RobotTaskExecutorNode(Node):
             "detail": detail,
             "progress": float(progress),
             "timestamp_s": time.time(),
+            "robot_id": robot_id,
         }
-        if robot_id is not None:
-            payload["robot_id"] = robot_id
         msg = String()
         msg.data = json.dumps(payload)
         self.status_pub.publish(msg)
