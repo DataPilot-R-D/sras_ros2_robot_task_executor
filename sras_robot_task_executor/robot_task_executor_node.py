@@ -33,6 +33,9 @@ from sras_robot_task_executor.execution_core import (
     TaskValidationError,
     ValidatedTask,
 )
+from sras_robot_task_executor.multi_robot_execution_core import (
+    MultiRobotExecutionCore,
+)
 
 
 NOTIFIABLE_STATES = {
@@ -95,6 +98,8 @@ class RobotTaskExecutorNode(Node):
         self.declare_parameter("use_json_transport_fallback", True)
         self.declare_parameter("dashboard_notifications_topic", "/ui/dashboard_notifications")
 
+        self.declare_parameter("multi_robot_enabled", False)
+
     def _load_config(self) -> None:
         self.task_request_topic = str(self.get_parameter("task_request_topic").value)
         self.task_status_topic = str(self.get_parameter("task_status_topic").value)
@@ -130,6 +135,7 @@ class RobotTaskExecutorNode(Node):
         self.dashboard_notifications_topic = str(
             self.get_parameter("dashboard_notifications_topic").value
         )
+        self.multi_robot_enabled = bool(self.get_parameter("multi_robot_enabled").value)
 
     def _setup_ros(self) -> None:
         self._last_map_msg_s: float | None = None
@@ -142,13 +148,36 @@ class RobotTaskExecutorNode(Node):
         self._active_goal_handle = None
         self._active_goal_sent_s: float | None = None
 
-        self.core = TaskExecutionCore(
-            max_queue_size=self.max_queue_size,
-            allow_preemption=self.allow_preemption,
-            require_map=self.require_map,
-            require_tf=self.require_tf,
-            require_nav_ready=self.require_nav_ready,
-        )
+        self._multi_core: MultiRobotExecutionCore | None = None
+        self._per_robot_nav_clients: dict[str, dict[str, ActionClient]] = {}
+
+        if self.multi_robot_enabled:
+            robot_ids = self._load_robot_ids()
+            self._multi_core = MultiRobotExecutionCore(
+                robot_ids=robot_ids,
+                max_queue_size=self.max_queue_size,
+                allow_preemption=self.allow_preemption,
+                require_map=self.require_map,
+                require_tf=self.require_tf,
+                require_nav_ready=self.require_nav_ready,
+            )
+            self.core = TaskExecutionCore(
+                max_queue_size=self.max_queue_size,
+                allow_preemption=self.allow_preemption,
+                require_map=self.require_map,
+                require_tf=self.require_tf,
+                require_nav_ready=self.require_nav_ready,
+            )
+            self._setup_per_robot_nav_clients(robot_ids)
+        else:
+            self.core = TaskExecutionCore(
+                max_queue_size=self.max_queue_size,
+                allow_preemption=self.allow_preemption,
+                require_map=self.require_map,
+                require_tf=self.require_tf,
+                require_nav_ready=self.require_nav_ready,
+            )
+
         self.nav_to_pose_client = ActionClient(self, NavigateToPose, self.nav_to_pose_action)
         self.nav_through_poses_client = ActionClient(
             self,
@@ -232,6 +261,38 @@ class RobotTaskExecutorNode(Node):
         self.stats_srv = self.create_service(Trigger, "~/get_stats", self._get_stats_callback)
         self.tick_timer = self.create_timer(1.0 / self.tick_hz, self._tick_callback)
 
+    def _load_robot_ids(self) -> list[str]:
+        try:
+            self.declare_parameter("robot_ids", ["robot0", "robot1"])
+            raw = self.get_parameter("robot_ids").value
+            if isinstance(raw, list):
+                return [str(r) for r in raw]
+        except Exception:
+            pass
+        return ["robot0", "robot1"]
+
+    def _setup_per_robot_nav_clients(self, robot_ids: list[str]) -> None:
+        for rid in robot_ids:
+            to_pose_param = f"{rid}_nav_to_pose_action"
+            through_poses_param = f"{rid}_nav_through_poses_action"
+            try:
+                self.declare_parameter(to_pose_param, f"/{rid}/navigate_to_pose")
+                self.declare_parameter(through_poses_param, f"/{rid}/navigate_through_poses")
+            except Exception:
+                pass
+
+            to_pose_action = str(self.get_parameter(to_pose_param).value)
+            through_poses_action = str(self.get_parameter(through_poses_param).value)
+
+            self._per_robot_nav_clients[rid] = {
+                "navigate_to_pose": ActionClient(self, NavigateToPose, to_pose_action),
+                "navigate_through_poses": ActionClient(self, NavigateThroughPoses, through_poses_action),
+            }
+            self.get_logger().info(
+                f"Multi-robot Nav2 clients for {rid}: "
+                f"to_pose={to_pose_action}, through_poses={through_poses_action}"
+            )
+
     def _log_startup(self) -> None:
         self.get_logger().info("=" * 60)
         self.get_logger().info("robot_task_executor_node started")
@@ -246,6 +307,13 @@ class RobotTaskExecutorNode(Node):
         self.get_logger().info(
             f"json_fallback: {'enabled' if self.use_json_transport_fallback else 'disabled'}"
         )
+        self.get_logger().info(
+            f"multi_robot: {'enabled' if self.multi_robot_enabled else 'disabled'}"
+        )
+        if self.multi_robot_enabled and self._multi_core is not None:
+            self.get_logger().info(
+                f"robot_ids: {self._multi_core.robot_ids}"
+            )
         self.get_logger().info("=" * 60)
 
     def _task_request_callback(self, msg: String) -> None:
@@ -260,8 +328,9 @@ class RobotTaskExecutorNode(Node):
             )
             return
 
+        target_core = self._multi_core if self._multi_core is not None else self.core
         try:
-            queued = self.core.enqueue_task(payload)
+            queued = target_core.enqueue_task(payload)
         except (TaskValidationError, QueueFullError) as exc:
             task_id = str(payload.get("task_id", "")).strip()
             self._publish_status(
@@ -287,8 +356,9 @@ class RobotTaskExecutorNode(Node):
 
         command = str(payload.get("command", "")).strip().lower()
         normalized_command = "cancel" if command == "stop" else command
+        target_core = self._multi_core if self._multi_core is not None else self.core
         try:
-            event = self.core.handle_command(payload)
+            event = target_core.handle_command(payload)
         except CommandRejectedError as exc:
             self._publish_status(
                 task_id=str(payload.get("task_id", "")).strip(),
@@ -320,20 +390,36 @@ class RobotTaskExecutorNode(Node):
         self._refresh_dispatch_readiness()
         self._enforce_goal_timeout()
 
-        dispatched = self.core.dispatch_next()
-        if dispatched is not None:
-            self._publish_event(dispatched)
-            if dispatched.state == "DISPATCHED":
-                self._dispatch_active_task_to_nav()
+        if self._multi_core is not None:
+            events = self._multi_core.dispatch_next_all()
+            for event in events:
+                self._publish_event(event)
+                if event.state == "DISPATCHED" and event.robot_id:
+                    self._dispatch_multi_robot_task(event.robot_id)
 
-        state = String()
-        state.data = json.dumps(self.core.snapshot())
-        self.state_pub.publish(state)
+            state = String()
+            state.data = json.dumps(self._multi_core.snapshot())
+            self.state_pub.publish(state)
+        else:
+            dispatched = self.core.dispatch_next()
+            if dispatched is not None:
+                self._publish_event(dispatched)
+                if dispatched.state == "DISPATCHED":
+                    self._dispatch_active_task_to_nav()
+
+            state = String()
+            state.data = json.dumps(self.core.snapshot())
+            self.state_pub.publish(state)
 
     def _get_stats_callback(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         del request
         response.success = True
-        response.message = json.dumps(self.core.snapshot())
+        snapshot = (
+            self._multi_core.snapshot()
+            if self._multi_core is not None
+            else self.core.snapshot()
+        )
+        response.message = json.dumps(snapshot)
         return response
 
     def _publish_event(self, event: StatusEvent) -> None:
@@ -342,6 +428,7 @@ class RobotTaskExecutorNode(Node):
             state=event.state,
             detail=event.detail,
             progress=event.progress,
+            robot_id=event.robot_id,
         )
         if event.state in NOTIFIABLE_STATES:
             self._publish_dashboard_notification(
@@ -443,6 +530,73 @@ class RobotTaskExecutorNode(Node):
                 active_task.task_id,
                 f"Failed to send Nav2 goal: {exc}",
             )
+            return
+
+        self._pending_goal_task_id = active_task.task_id
+        self._pending_goal_future = send_goal_future
+        self._pending_cancel_requested = False
+        self._active_goal_sent_s = time.monotonic()
+        send_goal_future.add_done_callback(
+            lambda future, task_id=active_task.task_id: self._on_nav_goal_response(task_id, future)
+        )
+
+    def _dispatch_multi_robot_task(self, robot_id: str) -> None:
+        if self._multi_core is None:
+            return
+        active_task = self._multi_core.get_active_task(robot_id)
+        if active_task is None:
+            return
+
+        if active_task.nav_action == "publish_report":
+            self._execute_report_task(active_task)
+            return
+
+        nav_clients = self._per_robot_nav_clients.get(robot_id)
+        if nav_clients is None:
+            nav_clients = {
+                "navigate_to_pose": self.nav_to_pose_client,
+                "navigate_through_poses": self.nav_through_poses_client,
+            }
+
+        try:
+            if active_task.nav_action == "navigate_to_pose":
+                client = nav_clients.get("navigate_to_pose", self.nav_to_pose_client)
+                goal_msg = NavigateToPose.Goal()
+                goal_msg.pose = self._build_pose(active_task.raw_payload["goal"])
+                send_goal_future = client.send_goal_async(
+                    goal_msg,
+                    feedback_callback=(
+                        lambda feedback_msg, task_id=active_task.task_id: self._on_nav_feedback(
+                            task_id, feedback_msg,
+                        )
+                    ),
+                )
+            elif active_task.nav_action == "navigate_through_poses":
+                client = nav_clients.get("navigate_through_poses", self.nav_through_poses_client)
+                goal_msg = NavigateThroughPoses.Goal()
+                goal_msg.poses = [
+                    self._build_pose(pose_dict) for pose_dict in active_task.raw_payload["poses"]
+                ]
+                send_goal_future = client.send_goal_async(
+                    goal_msg,
+                    feedback_callback=(
+                        lambda feedback_msg, task_id=active_task.task_id: self._on_nav_feedback(
+                            task_id, feedback_msg,
+                        )
+                    ),
+                )
+            else:
+                raise RuntimeError(f"Unsupported nav action mapping: {active_task.nav_action}")
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to send multi-robot Nav2 goal for {robot_id}: {exc}"
+            )
+            try:
+                self._multi_core.mark_terminal(
+                    robot_id, "FAILED", f"Failed to send Nav2 goal: {exc}",
+                )
+            except CommandRejectedError:
+                pass
             return
 
         self._pending_goal_task_id = active_task.task_id
@@ -706,11 +860,16 @@ class RobotTaskExecutorNode(Node):
         tf_ready = self._is_fresh(tf_latest_s, now_s, self.tf_stale_timeout_s)
         nav_ready = self._nav_action_servers_ready()
 
-        self.core.update_readiness(
-            map_ready=(not self.require_map) or map_ready,
-            tf_ready=(not self.require_tf) or tf_ready,
-            nav_ready=nav_ready,
-        )
+        readiness_kwargs = {
+            "map_ready": (not self.require_map) or map_ready,
+            "tf_ready": (not self.require_tf) or tf_ready,
+            "nav_ready": nav_ready,
+        }
+        self.core.update_readiness(**readiness_kwargs)
+
+        if self._multi_core is not None:
+            for rid in self._multi_core.robot_ids:
+                self._multi_core.update_readiness(rid, **readiness_kwargs)
 
     @staticmethod
     def _is_fresh(last_seen_s: float | None, now_s: float, stale_timeout_s: float) -> bool:
@@ -726,17 +885,25 @@ class RobotTaskExecutorNode(Node):
         through_poses_ready = self.nav_through_poses_client.wait_for_server(timeout_sec=0.0)
         return to_pose_ready and through_poses_ready
 
-    def _publish_status(self, task_id: str, state: str, detail: str, progress: float) -> None:
+    def _publish_status(
+        self,
+        task_id: str,
+        state: str,
+        detail: str,
+        progress: float,
+        robot_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "state": state,
+            "detail": detail,
+            "progress": float(progress),
+            "timestamp_s": time.time(),
+        }
+        if robot_id is not None:
+            payload["robot_id"] = robot_id
         msg = String()
-        msg.data = json.dumps(
-            {
-                "task_id": task_id,
-                "state": state,
-                "detail": detail,
-                "progress": float(progress),
-                "timestamp_s": time.time(),
-            }
-        )
+        msg.data = json.dumps(payload)
         self.status_pub.publish(msg)
 
     @staticmethod
