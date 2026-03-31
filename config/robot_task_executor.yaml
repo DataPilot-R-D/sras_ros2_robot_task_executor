@@ -32,3 +32,12 @@ robot_task_executor_node:
     journal_enabled: false
     journal_path: data/executor_journal.db
     use_json_transport_fallback: true
+
+    # Multi-robot configuration
+    multi_robot_enabled: false
+    robot_ids: ["robot0", "robot1"]
+    robot0_nav_to_pose_action: /robot0/navigate_to_pose
+    robot0_nav_through_poses_action: /robot0/navigate_through_poses
+    robot1_nav_to_pose_action: /robot1/navigate_to_pose
+    robot1_nav_through_poses_action: /robot1/navigate_through_poses
+    robot1_require_nav_ready: false

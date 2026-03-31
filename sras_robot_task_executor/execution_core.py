@@ -13,6 +13,9 @@ TASK_TYPE_TO_NAV_ACTION = {
     "INSPECT_POI": "navigate_to_pose",
     "INSPECT_BLINDSPOT": "navigate_to_pose",
     "INVESTIGATE_ALERT": "navigate_to_pose",
+    "PURSUE_THIEF": "navigate_to_pose",
+    "BLOCK_EXIT": "navigate_to_pose",
+    "GUARD_ASSET": "navigate_to_pose",
     "PATROL_ROUTE": "navigate_through_poses",
     "REPORT": "publish_report",
 }
@@ -40,6 +43,7 @@ class ValidatedTask:
     task_type: str
     nav_action: str
     raw_payload: dict[str, Any]
+    robot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +55,7 @@ class StatusEvent:
     detail: str
     progress: float = 0.0
     nav_action: str | None = None
+    robot_id: str | None = None
 
 
 class TaskExecutionCore:
@@ -127,6 +132,7 @@ class TaskExecutionCore:
             state="QUEUED",
             detail="Task accepted and queued for deterministic Nav2 execution",
             progress=0.0,
+            robot_id=task.robot_id,
         )
 
     def dispatch_next(self) -> StatusEvent | None:
@@ -149,6 +155,7 @@ class TaskExecutionCore:
                 state="BLOCKED",
                 detail=f"Dispatch blocked: {block_reason}",
                 progress=0.0,
+                robot_id=self._queue[0].robot_id,
             )
 
         task = self._queue.popleft()
@@ -161,6 +168,7 @@ class TaskExecutionCore:
             detail=f"Task dispatched via {task.nav_action}",
             progress=0.0,
             nav_action=task.nav_action,
+            robot_id=task.robot_id,
         )
 
     def mark_active(self) -> StatusEvent:
@@ -173,6 +181,7 @@ class TaskExecutionCore:
             detail="Task is now active on Nav2 action server",
             progress=0.0,
             nav_action=self._active_task.nav_action,
+            robot_id=self._active_task.robot_id,
         )
 
     def mark_terminal(self, terminal_state: str, detail: str) -> StatusEvent:
@@ -197,6 +206,7 @@ class TaskExecutionCore:
             detail=detail,
             progress=1.0 if state == "SUCCEEDED" else 0.0,
             nav_action=task.nav_action,
+            robot_id=task.robot_id,
         )
 
     def handle_command(self, command_payload: dict[str, Any]) -> StatusEvent:
@@ -217,6 +227,7 @@ class TaskExecutionCore:
                 detail="Approval is optional in Human-over-the-Loop mode",
                 progress=0.0,
                 nav_action=task.nav_action,
+                robot_id=task.robot_id,
             )
 
         if command == "cancel":
@@ -278,11 +289,15 @@ class TaskExecutionCore:
                 self._stats["tasks_invalid"] += 1
                 raise TaskValidationError("publish_report requires object field: report_data")
 
+        robot_id = raw_task.get("robot_id")
+        robot_id_str = str(robot_id).strip() if robot_id is not None else None
+
         return ValidatedTask(
             task_id=task_id,
             task_type=task_type,
             nav_action=nav_action,
             raw_payload=raw_task,
+            robot_id=robot_id_str or None,
         )
 
     def _find_task(self, task_id: str) -> ValidatedTask | None:
@@ -309,6 +324,7 @@ class TaskExecutionCore:
                 detail="Paused task canceled by operator command",
                 progress=0.0,
                 nav_action=paused.nav_action,
+                robot_id=paused.robot_id,
             )
 
         for index, task in enumerate(self._queue):
@@ -322,6 +338,7 @@ class TaskExecutionCore:
                 detail="Queued task canceled by operator command",
                 progress=0.0,
                 nav_action=task.nav_action,
+                robot_id=task.robot_id,
             )
 
         raise CommandRejectedError("Task not found for cancel")
@@ -342,6 +359,7 @@ class TaskExecutionCore:
             detail="Active task canceled for pause; ready for resumable re-dispatch",
             progress=0.0,
             nav_action=task.nav_action,
+            robot_id=task.robot_id,
         )
 
     def _resume_task(self, task_id: str) -> StatusEvent:
@@ -363,6 +381,7 @@ class TaskExecutionCore:
             detail="Paused task resumed via deterministic re-dispatch",
             progress=0.0,
             nav_action=task.nav_action,
+            robot_id=task.robot_id,
         )
 
     def _redefine_task(self, task_id: str, replacement_task: Any) -> StatusEvent:
@@ -389,6 +408,7 @@ class TaskExecutionCore:
                 detail="Paused task redefined by operator",
                 progress=0.0,
                 nav_action=replacement_validated.nav_action,
+                robot_id=replacement_validated.robot_id,
             )
 
         for idx, queued_task in enumerate(self._queue):
@@ -402,6 +422,7 @@ class TaskExecutionCore:
                 detail="Queued task redefined by operator",
                 progress=0.0,
                 nav_action=replacement_validated.nav_action,
+                robot_id=replacement_validated.robot_id,
             )
 
         raise CommandRejectedError("Task not found for redefine")
